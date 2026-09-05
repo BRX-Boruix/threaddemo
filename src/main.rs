@@ -25,7 +25,7 @@
 use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use libc::errno::{errno, set_errno};
 use libc::thread::{tls_allocate, tls_setup, Tcb};
-use libsys::{mmap, thread_exit, thread_join, thread_spawn_with_starter, write, yield_now, STDOUT};
+use libsys::{getpid, gettid, mmap, thread_exit, thread_join, thread_spawn_with_starter, write, yield_now, STDOUT};
 
 const THREAD_STACK_SIZE: u64 = 0x10000;
 const TCB_SIZE: u64 = 0x1000;
@@ -43,6 +43,14 @@ static mut SLOT_A: u64 = 0;
 static mut SLOT_B: u64 = 0;
 static mut PEER_B: u64 = 0;
 static mut PEER_A: u64 = 0;
+/// T2-6：组长 getpid==gettid（单线程组长）；成员 gettid=自身 pid、getpid=组长 tgid。
+static mut LEADER_TID: u64 = 0;
+static mut LEADER_PID: u64 = 0;
+static mut MEM_TID_A: u64 = 0;
+static mut MEM_PID_A: u64 = 0;
+static mut MEM_TID_B: u64 = 0;
+static mut MEM_PID_B: u64 = 0;
+static ID_FAILED: AtomicU8 = AtomicU8::new(0);
 
 fn u64_to_dec(mut v: u64, buf: &mut [u8; 20]) -> &[u8] {
     if v == 0 { buf[0] = b'0'; return &buf[..1]; }
@@ -61,6 +69,7 @@ fn td(s: &[u8]) {
 #[inline(never)]
 fn thread_a_body(tcb: u64) -> ! {
     libc::thread::write_fs_base(tcb);
+    unsafe { MEM_TID_A = gettid().unwrap_or(0); MEM_PID_A = getpid().unwrap_or(0); }
     tls_round(true, MARK_A, b"[thread-a] tls ");
     for i in 0u32..5 {
         set_errno(ENOENT);
@@ -85,6 +94,7 @@ fn thread_a_body(tcb: u64) -> ! {
 #[inline(never)]
 fn thread_b_body(tcb: u64) -> ! {
     libc::thread::write_fs_base(tcb);
+    unsafe { MEM_TID_B = gettid().unwrap_or(0); MEM_PID_B = getpid().unwrap_or(0); }
     tls_round(false, MARK_B, b"[thread-b] tls ");
     for i in 0u32..5 {
         set_errno(EAGAIN);
@@ -181,6 +191,35 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
     let _ = write(STDOUT, b"\n");
     let code_a = match join_thread(tid_a, 0) { Ok(c) => c, Err(_) => { td(b"thread_join(a) failed"); return 8; } };
     let code_b = match join_thread(tid_b, 0) { Ok(c) => c, Err(_) => { td(b"thread_join(b) failed"); return 9; } };
+    // T2-6 身份校验：组长单线程 getpid==gettid；两成员 gettid=各自 pid、getpid==组长 tgid。
+    unsafe { LEADER_TID = gettid().unwrap_or(0); LEADER_PID = getpid().unwrap_or(0); }
+    let leader_tid = unsafe { LEADER_TID };
+    let leader_pid = unsafe { LEADER_PID };
+    let mt_a = unsafe { MEM_TID_A };
+    let mp_a = unsafe { MEM_PID_A };
+    let mt_b = unsafe { MEM_TID_B };
+    let mp_b = unsafe { MEM_PID_B };
+    // 组长 tgid==组长 pid==leader_tid；成员 pid(组长 tgid) 都应等于 leader_tid；成员 tid != leader_tid。
+    let id_ok = leader_pid == leader_tid
+        && mp_a == leader_tid && mp_b == leader_tid
+        && mt_a != leader_tid && mt_b != leader_tid && mt_a != 0 && mt_b != 0;
+    if !id_ok { ID_FAILED.store(1, Ordering::SeqCst); }
+    let idbad = ID_FAILED.load(Ordering::SeqCst);
+    let _ = write(STDOUT, b"[threaddemo] id leader_tid=");
+    let _ = write(STDOUT, u64_to_dec(leader_tid, &mut b));
+    let _ = write(STDOUT, b" pid=");
+    let _ = write(STDOUT, u64_to_dec(leader_pid, &mut b));
+    let _ = write(STDOUT, b" a(tid,pid)=(");
+    let _ = write(STDOUT, u64_to_dec(mt_a, &mut b));
+    let _ = write(STDOUT, b",");
+    let _ = write(STDOUT, u64_to_dec(mp_a, &mut b));
+    let _ = write(STDOUT, b") b(tid,pid)=(");
+    let _ = write(STDOUT, u64_to_dec(mt_b, &mut b));
+    let _ = write(STDOUT, b",");
+    let _ = write(STDOUT, u64_to_dec(mp_b, &mut b));
+    let _ = write(STDOUT, b") id_failed=");
+    let _ = write(STDOUT, u64_to_dec(idbad as u64, &mut b));
+    let _ = write(STDOUT, b"\n");
     let shared = SHARED_COUNTER.load(Ordering::SeqCst);
     let ebad = ERRNO_FAILED.load(Ordering::SeqCst);
     let tbad = TLS_FAILED.load(Ordering::SeqCst);
@@ -209,12 +248,12 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
     let _ = write(STDOUT, if a_in && b_in { b"yes" } else { b"NO" });
     let _ = write(STDOUT, b"\n");
     let tls_ok = tbad == 0 && disj && slots_disj && a_in && b_in;
-    let pass: bool = shared == 10 && code_a == 0 && code_b == 0 && ebad == 0 && tls_ok;
+    let pass: bool = shared == 10 && code_a == 0 && code_b == 0 && ebad == 0 && tls_ok && idbad == 0;
     if pass {
-        td(b"threaddemo PASS (2 threads joined, shared addr-space, per-thread errno + TLS)");
+        td(b"threaddemo PASS (2 threads joined, per-thread errno + TLS + gettid/getpid identity)");
         0
     } else {
-        td(b"threaddemo FAIL (counter/join/errno/TLS mismatch)");
+        td(b"threaddemo FAIL (counter/join/errno/TLS/identity mismatch)");
         10
     }
 }
