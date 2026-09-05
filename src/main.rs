@@ -222,17 +222,20 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
     let _ = write(STDOUT, u64_to_dec(tid_b, &mut b));
     let _ = write(STDOUT, b"\n");
 
-    // 3) join 收尸：组长阻塞等 thread-a / thread-b 各自退出并取退出码。
-    //    若线程仍在运行 → 组长真阻塞（内核 waitpid 单目标交付）。两线程都与组长
-    //    共享地址空间，故两 join 都在组长用户栈/地址空间内完成。
-    let code_a = match thread_join(tid_a) {
+    // 3) join 收尸：组长等 thread-a / thread-b 各自退出并取退出码。内核 waitpid
+    //    单目标交付：线程仍在运行 → 组长阻塞等；线程已 zombie → 同步收尸。
+    //    单核下组长阻塞时线程就在同一核就绪队列，join 可干净阻塞；
+    //    SMP 下若组长所在核此刻无其它就绪进程可接盘、无法阻塞，waitpid 会如实返回
+    //    Err(WouldBlock)——这不是失败而是"暂时无法阻塞"，组长应让出后重试
+    //    （类 pthread_join 若无法阻塞则自旋），直到线程退出可被收尸。
+    let code_a = match join_thread(tid_a, 0) {
         Ok(c) => c,
         Err(_) => {
             td(b"thread_join(a) failed");
             return 6;
         }
     };
-    let code_b = match thread_join(tid_b) {
+    let code_b = match join_thread(tid_b, 0) {
         Ok(c) => c,
         Err(_) => {
             td(b"thread_join(b) failed");
@@ -273,4 +276,24 @@ fn write_hex(fd: u64, v: u64) -> Result<usize, libsys::Error> {
         start += 1;
     }
     write(fd, &tmp[start..])
+}
+
+/// 组长 join 一个线程并返回其退出码；attempt 为已重试次数（仅诊断）。
+///
+/// thread_join 在组长可阻塞时干净阻塞等组员退出；但 SMP 下若组长所在核此刻没有其它
+/// 就绪进程可接盘、内核无法让组长进入阻塞（否则自锁），会返回 Err(WouldBlock)。这不
+/// 是失败而是暂时无法阻塞：组长让出（yield_now）后重试——线程总会完成并留 zombie，
+/// 随后的 join 即同步收尸（类 pthread_join 无法阻塞时自旋）。
+fn join_thread(tid: u64, attempt: u32) -> Result<u64, libsys::Error> {
+    if attempt > 1_000_000 {
+        return Err(libsys::Error::WouldBlock); // 防御：重试过久仍未 join 到
+    }
+    match thread_join(tid) {
+        Ok(code) => Ok(code),
+        Err(libsys::Error::WouldBlock) => {
+            let _ = yield_now();
+            join_thread(tid, attempt + 1)
+        }
+        Err(e) => Err(e),
+    }
 }
