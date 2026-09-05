@@ -1,299 +1,158 @@
-//! BORUIX `threaddemo`：T1-8 端到端用户态多线程示例（threads.md T1-8 / ADR-035 阶段一收尾）。
+//! BORUIX `threaddemo`: end-to-end multithread demo (threads.md T1-8 + T2-1 per-thread errno).
 //!
-//! 目标：**真实用户态程序**在一个进程（组长 = 本 `user_main` 所在进程）内
-//! `thread_spawn` 派生两个同组线程（thread-a / thread-b），两者共享组长线程组的
-//! Arc 地址空间（同 cr3、同 /programs/threaddemo.elf 代码、同堆、同全局量），各自在
-//! **独立 mmap 用户栈**上被内核调度到、独立运行、独立打印，最后各自 `thread_exit`
-//! 由组长 `thread_join` 收尸，两 join 全成功后打印 PASS 并退出码 0。
+//! T1-8 baseline: same-process thread_spawn derives two threads (thread-a/b) sharing the leader
+//! ThreadGroup Arc addr space, each on its own mmap user stack, each thread_exit reaped by leader
+//! thread_join; PASS requires correct shared counter + join codes.
 //!
-//! # 线程入口调用约定（本里程碑核心）
+//! T2-1 addition: each thread installs its own libc Tcb (mmap, errno at offset 0) and sets
+//! IA32_FS_BASE (kernel T2-0 saves/restores per thread) to it; libc errno writes/reads then hit
+//! each thread own Tcb.errno. thread-a always sets ENOENT(2), thread-b EAGAIN(11); each re-reads
+//! must stay its own value across yields; if FS base leaks across a switch (b reads a slot) FAIL.
 //!
-//! 内核 `thread_spawn(entry, user_stack_top)`（SYS_TASK_THREAD_SPAWN/0x35）经
-//! `initial_frame(entry, user_stack_top)`（kernel task/scheduler.rs）为该新调度单元装配
-//! 首帧：首次被调度时以 `iretq` 直接进入 `entry`，`rsp = user_stack_top`，全部 GPR=0，
-//! **栈上没有任何返回地址**、也无 `_start` 那样的 `and rsp,-16` 对齐。因此：
-//!
-//! 1. 线程入口是**无参裸函数**（不能依赖寄存器参数、不能依赖栈上返回地址）；
-//! 2. 入口**必须永不正常返回**——Rust 侧以调用 `libsys::thread_exit(code)`
-//!    （= `process::exit` 别名，SYS_TASK_EXIT）收尾；内核 terminate_locked 按
-//!    调用方身份分流：组员调 = 仅该线程单体退出并留 zombie 供组长 join，不杀整组；
-//! 3. **栈对齐由入口自己负责**：SysV 假定函数进入点（call 后）`rsp%16==8`，而 iretq
-//!    进入时 `rsp=user_stack_top` 无对齐保证。故每个线程入口做成 `#[unsafe(naked)]`
-//!    汇编薄壳：先 `and rsp,-16` 对齐，再 `call` 一个永不返回的普通 Rust 函数——
-//!    该 call 压入返回地址使正文以标准 SysV 约定（rsp%16==8）进入，正文是普通可优化
-//!    的 Rust 函数（含 libsys 写/算），无任何 prologue 对齐依赖。入口地址即传给
-//!    内核的 naked 壳地址。
-//!
-//! # 栈来源（PRE-6 / ADR-035 D1/R5）
-//!
-//! 线程不新建地址空间、不 load ELF，只复用组长 Arc 地址空间；线程自己的用户栈由
-//! 用户态用 `libsys::mmap(size)` 在组长地址空间内预留一段并按需分页区，栈顶 =
-//! `mmap_start + size` 传给 `thread_spawn`（栈向下生长）。
+//! Thread entry ABI (T1-8 + T2-0 starter): kernel thread_spawn_with_starter(entry, stack, starter)
+//! (0x35, a3=starter) puts starter in first-run rdi (= this thread Tcb addr). entry is a naked
+//! shell keeping rdi then calls body(tcb). body never returns; thread_exit ends.
 
 #![no_std]
 #![no_main]
 
-use core::sync::atomic::{AtomicU64, Ordering};
-use libsys::{mmap, thread_exit, thread_join, thread_spawn, write, yield_now, STDOUT};
+use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use libc::errno::{errno, set_errno};
+use libsys::{mmap, thread_exit, thread_join, thread_spawn_with_starter, write, yield_now, STDOUT};
 
-// ---------------------------------------------------------------------------
-// 常量
-// ---------------------------------------------------------------------------
-
-/// 每线程独立用户栈区大小（字节）。用户态用 mmap 预留，栈顶 = 起点 + 此大小。
 const THREAD_STACK_SIZE: u64 = 0x10000;
-
-// ---------------------------------------------------------------------------
-// 共享的 Arc 地址空间可见全局量（证明两线程共享组长地址空间）
-// ---------------------------------------------------------------------------
-
-/// 线程组内共享计数：thread-a / thread-b 各自原子累加，组长 join 后回读验证
-/// "同一进程两个线程共享同一地址空间里的同一全局量"。
+const TCB_SIZE: u64 = 0x1000;
+const ENOENT: i32 = 2;
+const EAGAIN: i32 = 11;
 static SHARED_COUNTER: AtomicU64 = AtomicU64::new(0);
+static ERRNO_FAILED: AtomicU8 = AtomicU8::new(0);
+static mut PEER_B: u64 = 0;
+static mut PEER_A: u64 = 0;
 
-// ---------------------------------------------------------------------------
-// 打印辅助
-// ---------------------------------------------------------------------------
-
-/// 把 u64 写成十进制字节到 buf，返回有效切片（无前导零）。
 fn u64_to_dec(mut v: u64, buf: &mut [u8; 20]) -> &[u8] {
-    if v == 0 {
-        buf[0] = b'0';
-        return &buf[..1];
-    }
+    if v == 0 { buf[0] = b'0'; return &buf[..1]; }
     let mut i = buf.len();
-    while v > 0 {
-        i -= 1;
-        buf[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-    }
+    while v > 0 { i -= 1; buf[i] = b'0' + (v % 10) as u8; v /= 10; }
     &buf[i..]
 }
 
-/// 输出 "[threaddemo] " 前缀行（组长/入口正文统一走这里，方便日志识别）。
 fn td(s: &[u8]) {
     let _ = write(STDOUT, b"[threaddemo] ");
     let _ = write(STDOUT, s);
     let _ = write(STDOUT, b"\n");
 }
 
-// ---------------------------------------------------------------------------
-// 线程正文（普通 Rust 函数，SysV 约定进入；永不返回，以 thread_exit 收尾）
-// ---------------------------------------------------------------------------
-
-/// thread-a 的正文：纯整数计算 + 数次打印 + 原子共享累加；结束 thread_exit(0)。
-///
-/// 以 `!` 返回型声明 → 编译器知道不返回，无需 epilogue，栈上无返回地址依赖。
+/// thread-a body (T1-8 compute/print + T2-1 errno check). tcb = own Tcb addr (starter/rdi).
 #[inline(never)]
-fn thread_a_body() -> ! {
-    let mut acc: u64 = 0x1234_5678_9abc_def0;
+fn thread_a_body(tcb: u64) -> ! {
+    libc::thread::write_fs_base(tcb);
     for i in 0u32..5 {
-        // 一段有真实计算量的整数运算（使本线程在用户态确实"运行"而非瞬时完成）。
-        for _ in 0..300_000u32 {
-            acc = acc.wrapping_mul(6364136223846793005).wrapping_add(1);
-        }
+        set_errno(ENOENT);
+        for _ in 0..300_000u32 { let _x = (i as u64).wrapping_mul(6364136223846793005).wrapping_add(1); }
+        let _ = yield_now();
+        let own = errno();
+        let peer = unsafe { *(PEER_B as *const i32) };
+        if own != ENOENT || peer == ENOENT { ERRNO_FAILED.store(1, Ordering::SeqCst); }
         SHARED_COUNTER.fetch_add(1, Ordering::SeqCst);
         let mut b = [0u8; 20];
-        let s = u64_to_dec(i as u64, &mut b);
         let _ = write(STDOUT, b"[thread-a] i=");
-        let _ = write(STDOUT, s);
-        let _ = write(STDOUT, b" acc_lo=");
-        let lo = u64_to_dec(acc & 0xffff, &mut b);
-        let _ = write(STDOUT, lo);
+        let _ = write(STDOUT, u64_to_dec(i as u64, &mut b));
+        let _ = write(STDOUT, b" errno=");
+        let _ = write(STDOUT, u64_to_dec(own as u64, &mut b));
         let _ = write(STDOUT, b"\n");
-        // 主动让出 CPU，让调度器有机会切到 thread-b / 组长（真实并发调度证据）。
-        let _ = yield_now();
     }
-    td(b"thread-a done, thread_exit(0)");
+    td(b"thread-a done, errno stayed 2, thread_exit(0)");
     thread_exit(0)
 }
 
-/// thread-b 的正文：独立的一套整数计算 + 数次打印 + 原子共享累加；结束 thread_exit(0)。
+/// thread-b body (same, expect EAGAIN).
 #[inline(never)]
-fn thread_b_body() -> ! {
-    let mut acc: u64 = 0xfeed_beef_cafe_f00d;
+fn thread_b_body(tcb: u64) -> ! {
+    libc::thread::write_fs_base(tcb);
     for i in 0u32..5 {
-        for _ in 0..250_000u32 {
-            acc = acc.wrapping_mul(2862933555777941757).wrapping_add(3037000493);
-        }
+        set_errno(EAGAIN);
+        for _ in 0..250_000u32 { let _x = (i as u64).wrapping_mul(2862933555777941757).wrapping_add(3037000493); }
+        let _ = yield_now();
+        let own = errno();
+        let peer = unsafe { *(PEER_A as *const i32) };
+        if own != EAGAIN || peer == EAGAIN { ERRNO_FAILED.store(1, Ordering::SeqCst); }
         SHARED_COUNTER.fetch_add(1, Ordering::SeqCst);
         let mut b = [0u8; 20];
-        let s = u64_to_dec(i as u64, &mut b);
         let _ = write(STDOUT, b"[thread-b] i=");
-        let _ = write(STDOUT, s);
-        let _ = write(STDOUT, b" acc_lo=");
-        let lo = u64_to_dec(acc & 0xffff, &mut b);
-        let _ = write(STDOUT, lo);
+        let _ = write(STDOUT, u64_to_dec(i as u64, &mut b));
+        let _ = write(STDOUT, b" errno=");
+        let _ = write(STDOUT, u64_to_dec(own as u64, &mut b));
         let _ = write(STDOUT, b"\n");
-        let _ = yield_now();
     }
-    td(b"thread-b done, thread_exit(0)");
+    td(b"thread-b done, errno stayed 11, thread_exit(0)");
     thread_exit(0)
 }
 
-// ---------------------------------------------------------------------------
-// 线程入口（naked 薄壳：对齐栈 + call 永不返回的正文）
-// ---------------------------------------------------------------------------
-
-/// thread-a 线程入口：传给内核 thread_spawn 的地址即本符号地址。
-///
-/// iretq 直接进入本函数（rsp=user_stack_top、无返回地址）。先 `and rsp,-16`
-/// 对齐栈，再 `call thread_a_body`（压返回地址 → 正文以标准 SysV rsp%16==8
-/// 进入）。正文永不返回，故壳后无需 `ret`/处理。
 #[unsafe(naked)]
 unsafe extern "C" fn thread_a_entry() {
-    core::arch::naked_asm!(
-        "and rsp, -16",
-        "call {body}",
-        body = sym thread_a_body,
-    );
+    core::arch::naked_asm!("and rsp, -16", "call {b}", b = sym thread_a_body);
 }
-
-/// thread-b 线程入口（同 thread-a）。
 #[unsafe(naked)]
 unsafe extern "C" fn thread_b_entry() {
-    core::arch::naked_asm!(
-        "and rsp, -16",
-        "call {body}",
-        body = sym thread_b_body,
-    );
+    core::arch::naked_asm!("and rsp, -16", "call {b}", b = sym thread_b_body);
 }
 
-// ---------------------------------------------------------------------------
-// 用户程序入口（组长 = 本进程）
-// ---------------------------------------------------------------------------
-
-/// 组长 user_main：
-/// 1. 为 thread-a / thread-b 各自 mmap 一块独立用户栈（0x10000 字节），取栈顶；
-/// 2. thread_spawn(a_entry, stackA_top) / thread_spawn(b_entry, stackB_top) 各得 tid；
-/// 3. thread_join(tidA) / thread_join(tidB) 收退出码；
-/// 4. 两 join 成功 → 回读共享计数 → 打印 PASS → 返回 0（进程退出码）。
 #[unsafe(no_mangle)]
 pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
-    td(b"starting T1-8 two-thread demo...");
-
-    // 1) 每线程独立用户栈：mmap 0x10000 字节，栈顶 = 起点 + size（向下生长）。
-    //    mmap 失败按硬错误处理——本 demo 是全栈验证，栈分配失败即如实失败。
-    let stack_a_start = match mmap(THREAD_STACK_SIZE) {
-        Ok(s) => s,
-        Err(_) => {
-            td(b"mmap(stack A) failed");
-            return 2;
-        }
-    };
-    let stack_b_start = match mmap(THREAD_STACK_SIZE) {
-        Ok(s) => s,
-        Err(_) => {
-            td(b"mmap(stack B) failed");
-            return 3;
-        }
-    };
-    let stack_a_top = stack_a_start + THREAD_STACK_SIZE;
-    let stack_b_top = stack_b_start + THREAD_STACK_SIZE;
-    let mut b = [0u8; 20];
-    td(b"stacks mapped:");
-    let _ = write(STDOUT, b"[threaddemo]   stackA top=0x");
-    let _ = write_hex(STDOUT, stack_a_top);
-    let _ = write(STDOUT, b"\n");
-    let _ = write(STDOUT, b"[threaddemo]   stackB top=0x");
-    let _ = write_hex(STDOUT, stack_b_top);
-    let _ = write(STDOUT, b"\n");
-
-    // 2) 派生两个同组线程（共享本进程 Arc 地址空间，各自独立栈）。
+    td(b"starting threaddemo (T1-8 two threads + T2-1 per-thread errno)...");
+    let Ok(ra) = mmap(THREAD_STACK_SIZE) else { td(b"mmap stackA failed"); return 2; };
+    let Ok(rb) = mmap(THREAD_STACK_SIZE) else { td(b"mmap stackB failed"); return 3; };
+    let Ok(rc) = mmap(TCB_SIZE) else { td(b"mmap tcbA failed"); return 4; };
+    let Ok(rd) = mmap(TCB_SIZE) else { td(b"mmap tcbB failed"); return 5; };
+    let sa: u64 = ra + THREAD_STACK_SIZE;
+    let sb: u64 = rb + THREAD_STACK_SIZE;
+    let tcb_a: u64 = rc;
+    let tcb_b: u64 = rd;
+    unsafe { core::ptr::write_bytes(tcb_a as *mut u8, 0, 64); core::ptr::write_bytes(tcb_b as *mut u8, 0, 64); }
+    unsafe { PEER_B = tcb_b; PEER_A = tcb_a; }
     let a_entry = thread_a_entry as unsafe extern "C" fn() as usize as u64;
     let b_entry = thread_b_entry as unsafe extern "C" fn() as usize as u64;
-    let tid_a = match thread_spawn(a_entry, stack_a_top) {
-        Ok(t) => t,
-        Err(_) => {
-            td(b"thread_spawn(a) failed");
-            return 4;
-        }
-    };
-    let tid_b = match thread_spawn(b_entry, stack_b_top) {
-        Ok(t) => t,
-        Err(_) => {
-            td(b"thread_spawn(b) failed");
-            return 5;
-        }
-    };
-    let _ = write(STDOUT, b"[threaddemo] spawned thread-a tid=");
+    let mut b = [0u8; 20];
+    let _ = write(STDOUT, b"[threaddemo] tcb_a=0x");
+    let _ = write(STDOUT, u64_to_dec(tcb_a, &mut b));
+    let _ = write(STDOUT, b" tcb_b=0x");
+    let _ = write(STDOUT, u64_to_dec(tcb_b, &mut b));
+    let _ = write(STDOUT, b"\n");
+    let tid_a = match thread_spawn_with_starter(a_entry, sa, tcb_a) { Ok(t) => t, Err(_) => { td(b"thread_spawn(a) failed"); return 6; } };
+    let tid_b = match thread_spawn_with_starter(b_entry, sb, tcb_b) { Ok(t) => t, Err(_) => { td(b"thread_spawn(b) failed"); return 7; } };
+    let _ = write(STDOUT, b"[threaddemo] spawned a tid=");
     let _ = write(STDOUT, u64_to_dec(tid_a, &mut b));
-    let _ = write(STDOUT, b", thread-b tid=");
+    let _ = write(STDOUT, b", b tid=");
     let _ = write(STDOUT, u64_to_dec(tid_b, &mut b));
     let _ = write(STDOUT, b"\n");
-
-    // 3) join 收尸：组长等 thread-a / thread-b 各自退出并取退出码。内核 waitpid
-    //    单目标交付：线程仍在运行 → 组长阻塞等；线程已 zombie → 同步收尸。
-    //    单核下组长阻塞时线程就在同一核就绪队列，join 可干净阻塞；
-    //    SMP 下若组长所在核此刻无其它就绪进程可接盘、无法阻塞，waitpid 会如实返回
-    //    Err(WouldBlock)——这不是失败而是"暂时无法阻塞"，组长应让出后重试
-    //    （类 pthread_join 若无法阻塞则自旋），直到线程退出可被收尸。
-    let code_a = match join_thread(tid_a, 0) {
-        Ok(c) => c,
-        Err(_) => {
-            td(b"thread_join(a) failed");
-            return 6;
-        }
-    };
-    let code_b = match join_thread(tid_b, 0) {
-        Ok(c) => c,
-        Err(_) => {
-            td(b"thread_join(b) failed");
-            return 7;
-        }
-    };
-    let _ = write(STDOUT, b"[threaddemo] join(a) code=");
-    let _ = write(STDOUT, u64_to_dec(code_a, &mut b));
-    let _ = write(STDOUT, b", join(b) code=");
-    let _ = write(STDOUT, u64_to_dec(code_b, &mut b));
-    let _ = write(STDOUT, b"\n");
-
-    // 4) 回读共享计数（两线程各累加 5 次 → 应为 10，证明共享地址空间 + 都被调度）。
+    let code_a = match join_thread(tid_a, 0) { Ok(c) => c, Err(_) => { td(b"thread_join(a) failed"); return 8; } };
+    let code_b = match join_thread(tid_b, 0) { Ok(c) => c, Err(_) => { td(b"thread_join(b) failed"); return 9; } };
     let shared = SHARED_COUNTER.load(Ordering::SeqCst);
-    let _ = write(STDOUT, b"[threaddemo] shared counter = ");
+    let ebad = ERRNO_FAILED.load(Ordering::SeqCst);
+    let _ = write(STDOUT, b"[threaddemo] join codes a=");
+    let _ = write(STDOUT, u64_to_dec(code_a, &mut b));
+    let _ = write(STDOUT, b" b=");
+    let _ = write(STDOUT, u64_to_dec(code_b, &mut b));
+    let _ = write(STDOUT, b" shared=");
     let _ = write(STDOUT, u64_to_dec(shared, &mut b));
-    let _ = write(STDOUT, b" (expect 10)\n");
-
-    if shared == 10 && code_a == 0 && code_b == 0 {
-        td(b"threaddemo PASS (2 threads joined)");
+    let _ = write(STDOUT, b" errno_failed=");
+    let _ = write(STDOUT, u64_to_dec(ebad as u64, &mut b));
+    let _ = write(STDOUT, b"\n");
+    let pass: bool = shared == 10 && code_a == 0 && code_b == 0 && ebad == 0;
+    if pass {
+        td(b"threaddemo PASS (2 threads joined, shared addr-space, per-thread errno)");
         0
     } else {
-        td(b"threaddemo FAIL (counter or join code mismatch)");
-        8
+        td(b"threaddemo FAIL (counter/join/errno mismatch)");
+        10
     }
 }
 
-/// 写一段十六进制小写字符串到 fd（调试用，栈地址展示）。返回 write 结果。
-fn write_hex(fd: u64, v: u64) -> Result<usize, libsys::Error> {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut tmp = [0u8; 16];
-    for i in 0..16 {
-        tmp[15 - i] = HEX[((v >> (4 * i)) & 0xf) as usize];
-    }
-    // 去前导零
-    let mut start = 0;
-    while start < 15 && tmp[start] == b'0' {
-        start += 1;
-    }
-    write(fd, &tmp[start..])
-}
-
-/// 组长 join 一个线程并返回其退出码；attempt 为已重试次数（仅诊断）。
-///
-/// thread_join 在组长可阻塞时干净阻塞等组员退出；但 SMP 下若组长所在核此刻没有其它
-/// 就绪进程可接盘、内核无法让组长进入阻塞（否则自锁），会返回 Err(WouldBlock)。这不
-/// 是失败而是暂时无法阻塞：组长让出（yield_now）后重试——线程总会完成并留 zombie，
-/// 随后的 join 即同步收尸（类 pthread_join 无法阻塞时自旋）。
 fn join_thread(tid: u64, attempt: u32) -> Result<u64, libsys::Error> {
-    if attempt > 1_000_000 {
-        return Err(libsys::Error::WouldBlock); // 防御：重试过久仍未 join 到
-    }
+    if attempt > 1_000_000 { return Err(libsys::Error::WouldBlock); }
     match thread_join(tid) {
-        Ok(code) => Ok(code),
-        Err(libsys::Error::WouldBlock) => {
-            let _ = yield_now();
-            join_thread(tid, attempt + 1)
-        }
+        Ok(c) => Ok(c),
+        Err(libsys::Error::WouldBlock) => { let _ = yield_now(); join_thread(tid, attempt + 1) }
         Err(e) => Err(e),
     }
 }

@@ -12,6 +12,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "libc"
+version = "0.1.0"
+dependencies = [
+ "libsys",
+ "spin",
+]
+
+[[package]]
 name = "libsys"
 version = "0.1.0"
 dependencies = [
@@ -46,5 +54,6 @@ dependencies = [
 name = "threaddemo"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "libsys",
 ]

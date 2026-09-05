@@ -6,6 +6,7 @@ build = "build.rs"
 
 [dependencies]
 libsys = { path = "../libsys" }
+libc = { path = "../libc" }
 
 # 用户态裸机程序：无 unwinding 运行时，panic 直接 abort。
 [profile.dev]
