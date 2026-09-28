@@ -47,6 +47,6 @@ user_stack_top)`：首次调度 **iretq 直接进 entry**、`rsp=user_stack_top`
 ## 构建 / 运行
 
 - SDK 构建（build.py 已登记 threaddemo）：
-  `python sdk/main.py build`（生成 liveCD ISO，内嵌 threaddemo.elf）
-- 实跑（QEMU，单核或 SMP4）：`python sdk/main.py run --serial --no-smp` /
+  `python tools/main.py build`（生成 liveCD ISO，内嵌 threaddemo.elf）
+- 实跑（QEMU，单核或 SMP4）：`python tools/main.py run --serial --no-smp` /
   `--smp 4`；日志中可见两线程各自输出、join、`threaddemo PASS`，且 0 panic。
